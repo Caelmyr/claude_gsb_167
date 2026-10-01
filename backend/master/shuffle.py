@@ -54,19 +54,25 @@ class ShuffleCoordinator:
             pname = partition_name(p)
             sources: list[dict] = []
             total_bytes = 0
+            total_records = 0
             for mt in map_tasks:
                 worker = self.registry.get(mt.worker_id or "")
                 if worker is None:
                     continue
-                sizes = (mt.stats or {}).get("partition_sizes", {}) or {}
+                mt_stats = mt.stats or {}
+                sizes = mt_stats.get("partition_sizes", {}) or {}
+                record_counts = mt_stats.get("partition_records", {}) or {}
                 byte_count = int(sizes.get(f"{pname}.jsonl", 0))
+                record_count = int(record_counts.get(f"{pname}.jsonl", 0))
                 sources.append({
                     "map_task_id": mt.task_id,
                     "worker_id": mt.worker_id,
                     "worker_url": worker.address,
                     "bytes": byte_count,
+                    "records": record_count,
                 })
-                total_bytes += byte_count + 1
+                total_bytes += byte_count
+                total_records += record_count
 
             self.storage.write({
                 "job_id": job.job_id,
@@ -75,6 +81,7 @@ class ShuffleCoordinator:
                 "sources": sources,
                 "num_sources": len(sources),
                 "total_bytes": total_bytes,
+                "total_records": total_records,
                 "reduce_task_id": rt.task_id,
                 "status": "ready",
                 "fetched_bytes": 0,
@@ -90,6 +97,7 @@ class ShuffleCoordinator:
             rt.stats["fetch_plan"] = fetch_plan
             rt.stats["num_sources"] = len(fetch_plan)
             rt.stats["shuffle_bytes"] = total_bytes
+            rt.stats["shuffle_records"] = total_records
             self.job_manager.save_task(job.job_id, rt)
 
         self.logbus.info(
@@ -98,12 +106,14 @@ class ShuffleCoordinator:
             task_id="shuffle",
         )
 
-    def mark_partition_done(self, job: Job, partition: int, fetched_bytes: int = 0) -> None:
+    def mark_partition_done(self, job: Job, partition: int, fetched_bytes: int = 0,
+                            fetched_records: int = 0) -> None:
         self.storage.update(
             lambda doc: {
                 **(doc or {}),
                 "status": "done",
                 "fetched_bytes": fetched_bytes,
+                "fetched_records": fetched_records,
                 "updated_ms": now_ms(),
             },
             *self._partition_doc_path(job.job_id, partition),
@@ -119,12 +129,14 @@ class ShuffleCoordinator:
         partitions.sort(key=lambda d: d.get("partition", 0))
 
         total_bytes = sum(d.get("total_bytes", 0) for d in partitions)
+        total_records = sum(d.get("total_records", 0) for d in partitions)
         done = sum(1 for d in partitions if d.get("status") in ("done", "ready"))
         return {
             "job_id": job.job_id,
             "num_partitions": len(partitions),
             "partitions_done": done,
             "total_bytes": total_bytes,
+            "total_records": total_records,
             "progress_pct": round(done / len(partitions) * 100.0, 1) if partitions else 0.0,
             "partitions": partitions,
         }
@@ -136,4 +148,5 @@ class ShuffleCoordinator:
             "total": m["num_partitions"],
             "pct": m["progress_pct"],
             "total_bytes": m["total_bytes"],
+            "total_records": m["total_records"],
         }

@@ -10,8 +10,11 @@ async function render() {
   try { d = await API.get('/api/jobs/' + currentJob + '/shards'); } catch (e) { return; }
 
   const inputs = d.input_shards || [];
+  const inputTotal = inputs.reduce((sum, s) => sum + Number(s.count || 0), 0);
+  const mapProcessed = (d.map_tasks || []).reduce((sum, t) => sum + Number(t.records_processed || 0), 0);
+  const shuffledRecords = (d.shuffle && d.shuffle.total_records) || 0;
   document.getElementById('input-shards').innerHTML = inputs.length
-    ? `<div class="small muted mb">共 ${inputs.length} 个分片 shards</div>` + inputs.map(s =>
+    ? `<div class="small muted mb">共 ${inputs.length} 个分片 shards · 合计 ${C.fmtNum(inputTotal)} / 声明 ${C.fmtNum(d.input_rows)} · Map 已处理 ${C.fmtNum(mapProcessed)} · Shuffle ${C.fmtNum(shuffledRecords)}</div>` + inputs.map(s =>
         `<div class="flex between" style="padding:6px 0;border-bottom:1px solid var(--border)">
            <span class="mono">${C.esc(s.shard_id)}</span>
            <span class="muted">${C.fmtNum(s.count)} 条 records</span>

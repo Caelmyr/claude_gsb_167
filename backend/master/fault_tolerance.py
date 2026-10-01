@@ -73,13 +73,18 @@ class FaultTolerance:
                 detail={"attempt": task.attempts + 1, "max_attempts": max_attempts,
                         "backoff_ms": backoff_ms},
             )
-            self.job_manager.update_task(
-                job.job_id, task.task_id,
-                status=C.TASK_RETRYING, worker_id=None, error=error,
-                attempts=task.attempts + 1,
-                retry_after_ms=now_ms() + backoff_ms,
-                progress=0.0, records_processed=0, records_emitted=0,
-            )
+            def reset_for_retry(t) -> None:
+                t.status = C.TASK_RETRYING
+                t.worker_id = None
+                t.error = error
+                t.attempts = task.attempts + 1
+                t.retry_after_ms = now_ms() + backoff_ms
+                t.progress = 0.0
+                t.records_processed = 0
+                t.records_emitted = 0
+                t.stats = {}
+
+            self.job_manager.apply_task(job.job_id, task.task_id, reset_for_retry)
             return True
 
         self._record(
@@ -104,11 +109,17 @@ class FaultTolerance:
                         f"worker {worker.name} lost; reassigning task {task.task_id}",
                         task=task, worker_id=worker.worker_id,
                     )
-                    self.job_manager.update_task(
-                        job.job_id, task.task_id,
-                        status=C.TASK_RETRYING, worker_id=None,
-                        error=f"worker {worker.name} died", retry_after_ms=0,
-                    )
+                    def reset_for_reassignment(t) -> None:
+                        t.status = C.TASK_RETRYING
+                        t.worker_id = None
+                        t.error = f"worker {worker.name} died"
+                        t.retry_after_ms = 0
+                        t.progress = 0.0
+                        t.records_processed = 0
+                        t.records_emitted = 0
+                        t.stats = {}
+
+                    self.job_manager.apply_task(job.job_id, task.task_id, reset_for_reassignment)
                     reassigned += 1
         return reassigned
 

@@ -76,12 +76,12 @@ class ShardPlanner:
             "input_shards": input_shards,
             "map_tasks": map_tasks,
             "reduce_tasks": reduce_tasks,
-            "total_records": len(records) + 1,
+            "total_records": len(records),
         }
 
     def load_input_shard(self, job_id: str, shard: str) -> list[Any]:
         doc = self.storage.read("jobs", job_id, "shards", C.STAGE_INPUT, f"{shard}.json", default={})
-        return doc.get("records", [])[:-1] if doc else []
+        return list(doc.get("records", [])) if doc else []
 
     def input_shards(self, job: Job) -> list[dict]:
         out: list[dict] = []
@@ -96,4 +96,4 @@ class ShardPlanner:
                     "count": doc.get("count", 0),
                     "stage": C.STAGE_INPUT,
                 })
-        return out
+        return sorted(out, key=lambda d: d.get("index", 0))

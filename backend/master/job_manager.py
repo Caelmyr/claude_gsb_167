@@ -11,6 +11,7 @@ serialisation path.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 from typing import Callable, Optional
@@ -79,9 +80,9 @@ class JobManager:
             raise ValueError(f"unknown reducer: {reducer!r}")
 
         defaults = payload.get("_defaults") or {}
-        num_map = int(payload.get("num_map_tasks", defaults.get("num_map_tasks", 8)))
-        num_reduce = int(payload.get("num_reduce_tasks", defaults.get("num_reduce_tasks", 4)))
-        input_rows = int(payload.get("input_rows", defaults.get("input_rows", 12000)))
+        num_map = max(1, int(payload.get("num_map_tasks", defaults.get("num_map_tasks", 8))))
+        num_reduce = max(1, int(payload.get("num_reduce_tasks", defaults.get("num_reduce_tasks", 4))))
+        input_rows = max(1, int(payload.get("input_rows", defaults.get("input_rows", 12000))))
         params = dict(payload.get("params") or {})
         params["input_kind"] = input_kind_for(mapper)
 
@@ -94,7 +95,7 @@ class JobManager:
             job.reduce_task_ids = [t.task_id for t in plan["reduce_tasks"]]
             job.status = C.JOB_MAP
             job.started_ms = now_ms()
-            job.stats["total_records"] = plan["total_records"] + 1
+            job.stats["total_records"] = plan["total_records"]
             job.stats["input_kind"] = params["input_kind"]
 
             self._jobs[job.job_id] = job
@@ -164,6 +165,16 @@ class JobManager:
                     setattr(job, key, value)
             self.save_job(job)
         return job
+
+    @contextlib.contextmanager
+    def task_transition(self, job_id: str, task_id: str):
+        """Hold one task stable across a worker completion/failure transition."""
+        with self._lock:
+            task = self._tasks.get(job_id, {}).get(task_id)
+            if task is None:
+                yield None
+            else:
+                yield task
 
     def apply_task(self, job_id: str, task_id: str, fn: Callable[[Task], None]) -> Optional[Task]:
         """Run ``fn(task)`` under the manager lock and persist the result."""

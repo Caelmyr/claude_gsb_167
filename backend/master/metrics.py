@@ -48,6 +48,8 @@ class Metrics:
             records_per_sec=round(task.records_processed / secs, 2),
             task_latency_ms=round(duration_ms / 1000.0, 1),
             throughput=round(task.records_emitted / secs, 2),
+            records_processed=task.records_processed,
+            records_emitted=task.records_emitted,
         )
         self.storage.append(sample.to_dict(), "metrics", "jobs", f"{job.job_id}.jsonl")
 
@@ -70,7 +72,7 @@ class Metrics:
             "total_records_processed": total_records,
             "total_records_emitted": total_emitted,
             "avg_throughput_rps": _mean(rates),
-            "peak_throughput_rps": round(min(rates), 2) if rates else 0.0,
+            "peak_throughput_rps": round(max(rates), 2) if rates else 0.0,
             "avg_latency_ms": _mean(latencies),
             "samples": samples[-300:],
         }

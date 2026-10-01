@@ -26,7 +26,7 @@ from backend.common.ids import partition_name
 from backend.common.jsonutil import now_ms
 from backend.common.logbus import LogBus
 from backend.common.models import Job, Task, WorkerRecord
-from backend.common.storage import Storage
+from backend.common.storage import Storage, list_files, read_json
 from backend.master.fault_tolerance import FaultTolerance
 from backend.master.job_manager import JobManager
 from backend.master.metrics import Metrics
@@ -100,8 +100,10 @@ class Scheduler:
     def _advance(self, job: Job) -> None:
         status = job.status
         if status == C.JOB_MAP:
-            self._dispatch_tasks(job, C.TASK_MAP)
             map_tasks = self.job_manager.tasks_for(job.job_id, C.TASK_MAP)
+            if not map_tasks or not all(t.status == C.TASK_SUCCEEDED for t in map_tasks):
+                self._dispatch_tasks(job, C.TASK_MAP)
+                map_tasks = self.job_manager.tasks_for(job.job_id, C.TASK_MAP)
             if map_tasks and all(t.status == C.TASK_SUCCEEDED for t in map_tasks):
                 self.shuffle.build(job)
                 self.job_manager.apply_job(job.job_id, lambda j: (
@@ -117,8 +119,10 @@ class Scheduler:
                 self.logbus.info(job.job_id, "shuffle complete; reduce stage started",
                                  task_id="shuffle")
         elif status == C.JOB_REDUCE:
-            self._dispatch_tasks(job, C.TASK_REDUCE)
             reduce_tasks = self.job_manager.tasks_for(job.job_id, C.TASK_REDUCE)
+            if not reduce_tasks or not all(t.status == C.TASK_SUCCEEDED for t in reduce_tasks):
+                self._dispatch_tasks(job, C.TASK_REDUCE)
+                reduce_tasks = self.job_manager.tasks_for(job.job_id, C.TASK_REDUCE)
             if reduce_tasks and all(t.status == C.TASK_SUCCEEDED for t in reduce_tasks):
                 self._finish_success(job)
 
@@ -139,6 +143,9 @@ class Scheduler:
         for task in pending:
             if task.status == C.TASK_RETRYING and task.retry_after_ms > now_ms():
                 continue  # exponential backoff not yet elapsed
+            # Recompute availability each iteration because dispatching a task
+            # consumes one slot on the chosen worker.
+            workers = self._available_workers()
             worker = self._least_loaded(workers, exclude=None)
             if worker is None:
                 return
@@ -159,7 +166,10 @@ class Scheduler:
             if job.is_terminal:
                 continue
             for task in self.job_manager.tasks_for(job.job_id):
-                if task.worker_id == worker_id and task.status in C.TASK_ACTIVE_STATES:
+                speculative_workers = (task.stats or {}).get("speculative_workers", [])
+                if task.status in C.TASK_ACTIVE_STATES and (
+                    task.worker_id == worker_id or worker_id in speculative_workers
+                ):
                     count += 1
         return count
 
@@ -192,14 +202,15 @@ class Scheduler:
             return
 
         def mark_dispatched(t: Task) -> None:
-            t.status = C.TASK_ASSIGNED
-            t.assigned_ms = now_ms()
-            if not speculative:
-                t.worker_id = worker.worker_id
-            else:
+            if speculative:
                 stats = dict(t.stats or {})
+                stats.setdefault("original_worker", t.worker_id)
                 stats.setdefault("speculative_workers", []).append(worker.worker_id)
                 t.stats = stats
+            else:
+                t.status = C.TASK_ASSIGNED
+                t.worker_id = worker.worker_id
+                t.assigned_ms = now_ms()
 
         self.job_manager.apply_task(job.job_id, task.task_id, mark_dispatched)
         self.logbus.info(
@@ -217,7 +228,7 @@ class Scheduler:
             "mapper": job.mapper,
             "reducer": job.reducer,
             "params": job.params,
-            "attempt": 0,
+            "attempt": task.attempts,
             "simulate_failure": bool(job.params.get("simulate_failure", False)),
         }
         if task.kind == C.TASK_MAP:
@@ -239,11 +250,20 @@ class Scheduler:
         task = self.job_manager.get_task(job.job_id, payload.get("task_id", ""))
         if task is None or task.status == C.TASK_SUCCEEDED:
             return
+        if int(payload.get("attempt", 0)) != task.attempts:
+            return  # stale status from an older attempt
 
         def apply(t: Task) -> None:
+            reporter_id = payload.get("worker_id", "")
+            known_workers = {t.worker_id or ""}
+            known_workers.update((t.stats or {}).get("speculative_workers", []))
+            valid_reporter = not reporter_id or reporter_id in known_workers
+            if not valid_reporter:
+                return
             if t.status in (C.TASK_PENDING, C.TASK_RETRYING, C.TASK_ASSIGNED):
                 t.status = C.TASK_RUNNING
-                t.worker_id = payload.get("worker_id", t.worker_id)
+                if not t.worker_id:
+                    t.worker_id = reporter_id
             if not t.started_ms:
                 t.started_ms = now_ms()
             t.progress = float(payload.get("progress", t.progress))
@@ -256,49 +276,81 @@ class Scheduler:
         job = self.job_manager.get_job(payload.get("job_id", ""))
         if job is None:
             return
-        task = self.job_manager.get_task(job.job_id, payload.get("task_id", ""))
-        if task is None or task.status == C.TASK_SUCCEEDED:
-            return  # duplicate completion from a speculative loser
+        task_id = payload.get("task_id", "")
 
-        worker_id = payload.get("worker_id", "")
-        status = payload.get("status", C.TASK_FAILED)
+        with self.job_manager.task_transition(job.job_id, task_id) as task:
+            if task is None or task.status == C.TASK_SUCCEEDED:
+                return  # duplicate completion from a speculative loser
 
-        if status != C.TASK_SUCCEEDED:
-            self.registry.task_finished(worker_id, success=False)
-            self.fault_tolerance.handle_task_failure(job, task, payload.get("error", ""), worker_id)
-            return
+            worker_id = payload.get("worker_id", "")
+            status = payload.get("status", C.TASK_FAILED)
+            if int(payload.get("attempt", 0)) != task.attempts:
+                return  # stale completion from an older attempt
+            known_workers = {task.worker_id or ""}
+            known_workers.update((task.stats or {}).get("speculative_workers", []))
+            if worker_id and worker_id not in known_workers:
+                self.logbus.warn(
+                    job.job_id,
+                    f"ignored completion for {task_id} from unknown worker {worker_id}",
+                    task_id=task_id, worker_id=worker_id,
+                )
+                return
 
-        # Success path.
-        def apply(t: Task) -> None:
-            t.status = C.TASK_SUCCEEDED
-            t.progress = 1.0
-            t.records_processed = int(payload.get("records_processed", 0))
-            t.records_emitted = int(payload.get("records_emitted", 0))
-            t.duration_ms = int(payload.get("duration_ms", 0)) * 1000
-            t.finished_ms = now_ms()
-            t.error = ""
-            stats = dict(t.stats or {})
-            stats["partition_size_entries"] = payload.get("partition_sizes", {})
-            stats["results"] = payload.get("results", [])
-            stats["winning_worker"] = worker_id
-            t.stats = stats
+            if status != C.TASK_SUCCEEDED:
+                self.registry.task_finished(worker_id, success=False)
+                self.fault_tolerance.handle_task_failure(
+                    job, task, payload.get("error", ""), worker_id
+                )
+                return
 
-        self.job_manager.apply_task(job.job_id, task.task_id, apply)
+            # Success path. Capture completion data under the manager lock so a
+            # status callback from a speculative loser cannot overwrite the
+            # winning worker identity used to build the shuffle plan.
+            records_processed = int(payload.get("records_processed", 0))
+            records_emitted = int(payload.get("records_emitted", 0))
+            duration_ms = int(payload.get("duration_ms", 0)) * 1000
+            partition_sizes = payload.get("partition_sizes", {})
+            partition_records = payload.get("partition_records", {})
+            results = payload.get("results", [])
+
+            def apply(t: Task) -> None:
+                t.status = C.TASK_SUCCEEDED
+                t.worker_id = worker_id
+                t.progress = 1.0
+                t.records_processed = records_processed
+                t.records_emitted = records_emitted
+                t.duration_ms = duration_ms
+                t.finished_ms = now_ms()
+                t.error = ""
+                stats = dict(t.stats or {})
+                stats["partition_sizes"] = partition_sizes
+                stats["partition_records"] = partition_records
+                stats["results"] = results
+                stats["winning_worker"] = worker_id
+                t.stats = stats
+
+            self.job_manager.apply_task(job.job_id, task_id, apply)
+
+        completed_task = self.job_manager.get_task(job.job_id, task_id)
         self.registry.task_finished(worker_id, success=True)
-        self.metrics.record_task(job, task, int(payload.get("duration_ms", 0)))
+        self.metrics.record_task(job, completed_task, int(payload.get("duration_ms", 0)))
 
-        if task.kind == C.TASK_REDUCE:
-            self._store_results(job, task, payload.get("results", []))
-            self.shuffle.mark_partition_done(job, task.partition,
-                                             task.stats.get("shuffle_bytes", 0))
+        if completed_task.kind == C.TASK_REDUCE:
+            self._store_results(job, completed_task, results)
+            self.shuffle.mark_partition_done(
+                job,
+                completed_task.partition,
+                completed_task.stats.get("shuffle_bytes", 0),
+                completed_task.records_processed,
+            )
 
         self.logbus.info(
             job.job_id,
-            f"task {task.task_id} succeeded ({payload.get('records_processed', 0)} records, "
+            f"task {task_id} succeeded ({records_processed} records, "
             f"{payload.get('duration_ms', 0)} ms)",
-            task_id=task.task_id, worker_id=worker_id,
+            task_id=task_id, worker_id=worker_id,
         )
-        self._cancel_speculative_losers(job, task, worker_id)
+        self._cancel_speculative_losers(job, completed_task, worker_id)
 
     def _store_results(self, job: Job, task: Task, results: list) -> None:
         pname = partition_name(task.partition)
@@ -307,15 +359,16 @@ class Scheduler:
             "partition": task.partition,
             "partition_name": pname,
             "task_id": task.task_id,
-            "records": list(reversed(results)),
+            "records": results,
             "count": len(results),
             "written_ms": now_ms(),
         }, "jobs", job.job_id, "results", C.STAGE_REDUCE, f"{pname}.json")
 
     def _cancel_speculative_losers(self, job: Job, task: Task, winner_worker_id: str) -> None:
         losers = list((task.stats or {}).get("speculative_workers", []))
-        if winner_worker_id != task.worker_id and task.worker_id:
-            losers.append(task.worker_id)
+        original_worker = (task.stats or {}).get("original_worker", "")
+        if original_worker and winner_worker_id != original_worker:
+            losers.append(original_worker)
         for wid in losers:
             if wid == winner_worker_id:
                 continue
@@ -323,21 +376,66 @@ class Scheduler:
             if worker is not None:
                 try:
                     self.client.post(f"{worker.address}/task/cancel",
-                                     {"task_id": task.task_id}, timeout=2.0)
+                                     {"job_id": job.job_id, "task_id": task.task_id},
+                                     timeout=2.0)
                 except Exception:  # noqa: BLE001
                     pass
 
     # ------------------------------------------------------------------
+    def _result_partitions(self, job: Job) -> list[dict]:
+        out: list[dict] = []
+        root = self.storage.path("jobs", job.job_id, "results", C.STAGE_REDUCE)
+        for path in list_files(root, suffix=".json"):
+            doc = read_json(path)
+            if doc:
+                out.append(doc)
+        return out
+
     def _finish_success(self, job: Job) -> None:
         map_tasks = self.job_manager.tasks_for(job.job_id, C.TASK_MAP)
         reduce_tasks = self.job_manager.tasks_for(job.job_id, C.TASK_REDUCE)
+        input_count = sum(
+            shard.get("count", 0)
+            for shard in self.job_manager.planner.input_shards(job)
+        )
+        map_processed = sum(t.records_processed for t in map_tasks)
+        map_emitted = sum(t.records_emitted for t in map_tasks)
+        reduce_fetched = sum(t.records_processed for t in reduce_tasks)
+        reduce_emitted = sum(t.records_emitted for t in reduce_tasks)
+        result_count = sum(p.get("count", 0) for p in self._result_partitions(job))
+
+        def mismatch(message: str) -> None:
+            self.logbus.error(job.job_id, message, task_id="job")
+            self.job_manager.fail(job, message)
+
+        if map_processed != input_count or map_processed != job.input_rows:
+            mismatch(
+                f"input accounting mismatch: shards={input_count}, "
+                f"declared={job.input_rows}, map_processed={map_processed}"
+            )
+            return
+        if reduce_fetched != map_emitted:
+            mismatch(
+                f"shuffle accounting mismatch: map_emitted={map_emitted}, "
+                f"reduce_fetched={reduce_fetched}"
+            )
+            return
+        if result_count != reduce_emitted:
+            mismatch(
+                f"result accounting mismatch: reduce_emitted={reduce_emitted}, "
+                f"stored={result_count}"
+            )
+            return
 
         def apply(j: Job) -> None:
             j.status = C.JOB_SUCCEEDED
             j.finished_ms = now_ms()
-            j.stats["map_records_processed"] = sum(t.records_processed for t in map_tasks)
-            j.stats["map_records_emitted"] = sum(t.records_emitted for t in map_tasks)
-            j.stats["reduce_records_emitted"] = sum(t.records_emitted for t in reduce_tasks) + sum(t.records_emitted for t in map_tasks)
+            j.stats["input_shard_records"] = input_count
+            j.stats["map_records_processed"] = map_processed
+            j.stats["map_records_emitted"] = map_emitted
+            j.stats["shuffle_records_fetched"] = reduce_fetched
+            j.stats["reduce_records_emitted"] = reduce_emitted
+            j.stats["result_records"] = result_count
             j.stats["total_task_attempts"] = sum(t.attempts for t in map_tasks + reduce_tasks)
 
         self.job_manager.apply_job(job.job_id, apply)

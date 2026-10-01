@@ -14,6 +14,7 @@ async function render() {
     { label: '分区数 Partitions', value: m.num_partitions },
     { label: '已完成 Done', value: m.partitions_done, cls: m.partitions_done ? 'good' : '' },
     { label: 'Shuffle 总量 Total bytes', value: C.fmtBytes(m.total_bytes) },
+    { label: 'Shuffle 记录 Records', value: C.fmtNum(m.total_records || 0) },
     { label: '进度 Progress', value: (m.progress_pct || 0) + '%', cls: (m.progress_pct >= 100) ? 'good' : '' },
   ].map(s => `<div class="stat"><div class="label">${s.label}</div><div class="value ${s.cls || ''}">${C.esc(s.value)}</div></div>`).join('');
 
@@ -21,6 +22,7 @@ async function render() {
     { key: 'partition_name', label: '分区 Partition', render: r => `<span class="mono">${C.esc(r.partition_name)}</span>` },
     { key: 'num_sources', label: '源数 Sources', render: r => r.num_sources, num: true },
     { key: 'total_bytes', label: '数据量 Bytes', render: r => C.fmtBytes(r.total_bytes), num: true },
+    { key: 'total_records', label: '记录数 Records', render: r => C.fmtNum(r.total_records || 0), num: true },
     { key: 'status', label: '状态 Status', render: r => C.stateBadge(r.status, true) },
     { key: 'reduce_task_id', label: 'Reduce 任务 Task', render: r => `<span class="mono">${C.esc(r.reduce_task_id)}</span>` },
     { key: 'sources', label: '来源 Sources (map → bytes)', render: r => sourceList(r) },
@@ -31,7 +33,7 @@ function sourceList(r) {
   const srcs = r.sources || [];
   if (!srcs.length) return '<span class="muted">-</span>';
   return '<div class="small mono" style="max-height:72px;overflow-y:auto">' +
-    srcs.map(s => `<div>${C.esc(s.map_task_id)} @ ${C.esc(s.worker_id || '')} → ${C.fmtBytes(s.bytes)}</div>`).join('') +
+    srcs.map(s => `<div>${C.esc(s.map_task_id)} @ ${C.esc(s.worker_id || '')} → ${C.fmtNum(s.records || 0)} 条 / ${C.fmtBytes(s.bytes)}</div>`).join('') +
     '</div>';
 }
 

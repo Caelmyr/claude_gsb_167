@@ -201,6 +201,8 @@ class MetricSample:
     ts_ms: int
     job_id: str = ""
     worker_id: str = ""
+    records_processed: int = 0
+    records_emitted: int = 0
     records_per_sec: float = 0.0
     task_latency_ms: float = 0.0
     cpu_percent: float = 0.0

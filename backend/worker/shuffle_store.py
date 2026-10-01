@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import heapq
 import os
+import uuid
 from typing import Any, Iterable, Iterator, Optional
 
 from backend.common import jsonutil
@@ -79,11 +80,11 @@ class ShuffleStore:
         return out
 
     def partition_sizes(self, job_id: str, task_id: str) -> dict[str, int]:
-        """``{part-0000: bytes, ...}`` for every partition a map task produced."""
+        """``{part-0000.jsonl: bytes, ...}`` for every produced partition."""
         d = self.job_dir(job_id, task_id)
         sizes: dict[str, int] = {}
         for path in list_files(d, suffix=".jsonl"):
-            sizes[os.path.splitext(os.path.basename(path))[0]] = os.path.getsize(path)
+            sizes[os.path.basename(path)] = os.path.getsize(path)
         return sizes
 
     def partition_indices(self, job_id: str, task_id: str) -> list[int]:
@@ -93,11 +94,15 @@ class ShuffleStore:
             for p in list_files(d, suffix=".jsonl")
         )
 
-    def cleanup(self, job_id: str, task_id: str) -> None:
+    def cleanup(self, job_id: str, task_id: str = "") -> None:
         import shutil
-        d = self.job_dir(job_id, task_id)
+        d = self.job_dir(job_id, task_id) if task_id else self.job_dir(job_id)
         if os.path.isdir(d):
             shutil.rmtree(d, ignore_errors=True)
+
+    def reset_task(self, job_id: str, task_id: str) -> None:
+        """Remove all output from a previous attempt before a deterministic rerun."""
+        self.cleanup(job_id, task_id)
 
 
 class SpillSorter:
@@ -133,7 +138,10 @@ class SpillSorter:
         # Sort by key.  Map/reduce keys for the built-in mappers are homogeneous
         # strings, so native ordering matches the grouping comparison.
         self._mem.sort(key=lambda kv: kv[0])
-        path = os.path.join(self.work_dir, f"gsb-sort-{os.getpid()}-{self._run_seq}.jsonl")
+        path = os.path.join(
+            self.work_dir,
+            f"gsb-sort-{os.getpid()}-{self._run_seq}-{uuid.uuid4().hex}.jsonl",
+        )
         self._run_seq += 1
         atomic_write_text(
             path,
