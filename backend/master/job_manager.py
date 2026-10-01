@@ -79,9 +79,14 @@ class JobManager:
             raise ValueError(f"unknown reducer: {reducer!r}")
 
         defaults = payload.get("_defaults") or {}
-        num_map = int(payload.get("num_map_tasks", defaults.get("num_map_tasks", 8)))
-        num_reduce = int(payload.get("num_reduce_tasks", defaults.get("num_reduce_tasks", 4)))
-        input_rows = int(payload.get("input_rows", defaults.get("input_rows", 12000)))
+        try:
+            num_map = int(payload.get("num_map_tasks", defaults.get("num_map_tasks", 8)))
+            num_reduce = int(payload.get("num_reduce_tasks", defaults.get("num_reduce_tasks", 4)))
+            input_rows = int(payload.get("input_rows", defaults.get("input_rows", 12000)))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("num_map_tasks, num_reduce_tasks and input_rows must be integers") from exc
+        if num_map < 1 or num_reduce < 1 or input_rows < 1:
+            raise ValueError("num_map_tasks, num_reduce_tasks and input_rows must be positive")
         params = dict(payload.get("params") or {})
         params["input_kind"] = input_kind_for(mapper)
 
@@ -94,7 +99,12 @@ class JobManager:
             job.reduce_task_ids = [t.task_id for t in plan["reduce_tasks"]]
             job.status = C.JOB_MAP
             job.started_ms = now_ms()
-            job.stats["total_records"] = plan["total_records"] + 1
+            job.stats["total_records"] = plan["total_records"]
+            if job.stats["total_records"] != job.input_rows:
+                raise ValueError(
+                    f"input shard count mismatch: declared {job.input_rows}, "
+                    f"planned {job.stats['total_records']}"
+                )
             job.stats["input_kind"] = params["input_kind"]
 
             self._jobs[job.job_id] = job

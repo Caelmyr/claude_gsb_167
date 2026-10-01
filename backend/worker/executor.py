@@ -43,6 +43,7 @@ def _run_map(spec: dict, data_root: str, progress_cb: ProgressCallback) -> dict:
     """Run a map task: mapper(records) -> hash-partitioned shuffle files."""
     mapper = get_mapper(spec["mapper"])
     store = ShuffleStore(data_root)
+    store.reset_task(spec["job_id"], spec["task_id"])
     records: list[Any] = spec.get("records", [])
     num_partitions = max(1, int(spec.get("partition_count", 1)))
     params = spec.get("params", {}) or {}
@@ -79,7 +80,7 @@ def _run_map(spec: dict, data_root: str, progress_cb: ProgressCallback) -> dict:
     return {
         "records_processed": processed,
         "records_emitted": emitted,
-        "partition_sizes": {k: v // 1024 for k, v in store.partition_sizes(job_id, task_id).items()},
+        "partition_sizes": store.partition_sizes(job_id, task_id),
     }
 
 
@@ -128,7 +129,7 @@ def _run_reduce(spec: dict, progress_cb: ProgressCallback) -> dict:
             values = [value]
         else:
             values.append(value)
-    if prev_key is not None and len(results) < 0:
+    if prev_key is not None:
         results.append(reducer(prev_key, values, params))
 
     return {
@@ -142,7 +143,7 @@ def _run_reduce(spec: dict, progress_cb: ProgressCallback) -> dict:
 def _execute_task(spec: dict, data_root: str, progress_cb: ProgressCallback) -> dict:
     # Fault injection: when a job opts in, the first attempt of every task raises
     # so the fault-recovery path (retry -> reassign) is exercised end to end.
-    if spec.get("simulate_failure"):
+    if spec.get("simulate_failure") and int(spec.get("attempt", 0)) == 0:
         raise RuntimeError("simulated failure for fault-injection demo (attempt 0)")
     if spec.get("kind") == C.TASK_MAP:
         return _run_map(spec, data_root, progress_cb)
@@ -199,6 +200,10 @@ class Executor:
         os.makedirs(self._tmp_dir, exist_ok=True)
 
     # -- bookkeeping --------------------------------------------------
+    @staticmethod
+    def _execution_id(job_id: str, task_id: str) -> str:
+        return f"{job_id}:{task_id}"
+
     @property
     def running_count(self) -> int:
         with self._lock:
@@ -206,45 +211,66 @@ class Executor:
 
     def running_task_ids(self) -> list[str]:
         with self._lock:
-            return list(self._handles.keys())
+            return [handle["spec"]["task_id"] for handle in self._handles.values()]
 
     # -- dispatch -----------------------------------------------------
     def start_task(self, spec: dict) -> bool:
-        task_id = spec["task_id"]
+        execution_id = self._execution_id(spec["job_id"], spec["task_id"])
         # Inject config-derived execution parameters so the Master does not need
         # to know worker-local tuning (spill threshold, temp directory).
         spec = dict(spec)
         spec.setdefault("spill_records", int(getattr(self.config, "shuffle_spill_records", 20000)))
         spec.setdefault("tmp_dir", self._tmp_dir)
         with self._lock:
-            if task_id in self._handles:
+            if execution_id in self._handles:
                 return False
-            self._handles[task_id] = {
+            self._handles[execution_id] = {
                 "spec": spec,
                 "started_ms": now_ms(),
                 "cancel": threading.Event(),
                 "last_status_ms": 0,
             }
         runner = self._run_process if self.exec_mode == "process" else self._run_thread
-        threading.Thread(target=runner, args=(task_id,), daemon=True, name=f"task-{task_id}").start()
+        threading.Thread(target=runner, args=(execution_id,), daemon=True,
+                         name=f"task-{execution_id.replace(':', '-')}").start()
         return True
 
-    def cancel(self, task_id: str) -> bool:
+    def cancel(self, job_id: str, task_id: str) -> bool:
+        execution_id = self._execution_id(job_id, task_id)
         with self._lock:
-            handle = self._handles.get(task_id)
+            handle = self._handles.get(execution_id)
+            if handle is None and not job_id:
+                # Backward-compatible fallback for older Master requests that
+                # only carried the per-job task id ("m-0000").  Do not use this
+                # as the dispatch key: it is ambiguous across concurrent jobs.
+                matches = [
+                    (eid, h) for eid, h in self._handles.items()
+                    if h["spec"].get("task_id") == task_id
+                ]
+                if len(matches) != 1:
+                    return False
+                execution_id, handle = matches[0]
         if handle:
             handle["cancel"].set()
             return True
         return False
 
     def shutdown(self) -> None:
-        for task_id in self.running_task_ids():
-            self.cancel(task_id)
+        with self._lock:
+            handles = list(self._handles.values())
+        for handle in handles:
+            handle["cancel"].set()
 
     # -- thread backend ----------------------------------------------
-    def _run_thread(self, task_id: str) -> None:
-        handle = self._handles[task_id]
-        spec = handle["spec"]
+    def _run_thread(self, execution_id: str) -> None:
+        handle = self._handles[execution_id]
+        spec = dict(handle["spec"])
+        task_tmp_dir = os.path.join(
+            self._tmp_dir,
+            f"task-{spec['job_id']}-{spec['task_id']}-{now_ms()}",
+        )
+        os.makedirs(task_tmp_dir, exist_ok=True)
+        spec["tmp_dir"] = task_tmp_dir
 
         def progress_cb(progress: float, processed: int, emitted: int) -> None:
             self._post_status(spec, handle, progress, processed, emitted)
@@ -252,23 +278,27 @@ class Executor:
         try:
             result = _execute_task(spec, self.data_root, progress_cb)
             result["status"] = C.TASK_SUCCEEDED
-            self._complete(task_id, result)
+            self._complete(execution_id, result)
         except Exception as exc:  # noqa: BLE001
-            self._complete(task_id, {
+            self._complete(execution_id, {
                 "status": C.TASK_FAILED,
                 "error": f"{type(exc).__name__}: {exc}",
             })
         finally:
-            self._remove(task_id)
+            self._remove(execution_id)
 
     # -- process backend ---------------------------------------------
-    def _run_process(self, task_id: str) -> None:
-        handle = self._handles[task_id]
-        spec = handle["spec"]
-        work_dir = os.path.join(self._tmp_dir, f"task-{task_id}-{now_ms()}")
-        os.makedirs(work_dir, exist_ok=True)
-        progress_path = os.path.join(work_dir, "progress.json")
-        result_path = os.path.join(work_dir, "result.json")
+    def _run_process(self, execution_id: str) -> None:
+        handle = self._handles[execution_id]
+        spec = dict(handle["spec"])
+        task_tmp_dir = os.path.join(
+            self._tmp_dir,
+            f"task-{spec['job_id']}-{spec['task_id']}-{now_ms()}",
+        )
+        os.makedirs(task_tmp_dir, exist_ok=True)
+        spec["tmp_dir"] = task_tmp_dir
+        progress_path = os.path.join(task_tmp_dir, "progress.json")
+        result_path = os.path.join(task_tmp_dir, "result.json")
         atomic_write_json(progress_path, {"progress": 0.0, "processed": 0, "emitted": 0})
 
         # ``fork`` (the Linux default) is used for speed and so the child can
@@ -277,7 +307,7 @@ class Executor:
         proc = ctx.Process(
             target=_execute_in_process,
             args=(spec, self.data_root, progress_path, result_path),
-            name=f"mr-{task_id}",
+            name=f"mr-{spec['job_id']}-{spec['task_id']}",
         )
         proc.start()
 
@@ -285,8 +315,8 @@ class Executor:
             if handle["cancel"].is_set():
                 proc.terminate()
                 proc.join(timeout=2.0)
-                self._complete(task_id, {"status": C.TASK_FAILED, "error": "cancelled"})
-                self._remove(task_id)
+                self._complete(execution_id, {"status": C.TASK_FAILED, "error": "cancelled"})
+                self._remove(execution_id)
                 return
             time.sleep(0.25)
             prog = read_json(progress_path)
@@ -296,8 +326,8 @@ class Executor:
         proc.join()
 
         result = read_json(result_path, default={"status": C.TASK_FAILED, "error": "no result file"})
-        self._complete(task_id, result)
-        self._remove(task_id)
+        self._complete(execution_id, result)
+        self._remove(execution_id)
 
     # -- reporting to master -----------------------------------------
     def _post(self, path: str, payload: dict) -> None:
@@ -318,29 +348,33 @@ class Executor:
             "worker_id": self.worker_id,
             "job_id": spec["job_id"],
             "task_id": spec["task_id"],
+            "attempt": int(spec.get("attempt", 0)),
             "status": C.TASK_RUNNING,
             "progress": round(min(1.0, max(0.0, progress)), 4),
             "records_processed": processed,
             "records_emitted": emitted,
         })
 
-    def _complete(self, task_id: str, result: dict) -> None:
-        handle = self._handles.get(task_id)
-        spec = handle["spec"] if handle else {}
+    def _complete(self, execution_id: str, result: dict) -> None:
+        with self._lock:
+            handle = self._handles.get(execution_id)
+            spec = dict(handle["spec"]) if handle else {}
+            started_ms = handle["started_ms"] if handle else now_ms()
         self._post("/api/workers/task-complete", {
             "worker_id": self.worker_id,
             "job_id": spec.get("job_id", ""),
-            "task_id": task_id,
+            "task_id": spec.get("task_id", ""),
             "kind": spec.get("kind", ""),
+            "attempt": int(spec.get("attempt", 0)),
             "status": result.get("status", C.TASK_FAILED),
             "records_processed": result.get("records_processed", 0),
             "records_emitted": result.get("records_emitted", 0),
-            "duration_ms": int((now_ms() - handle["started_ms"]) / 1000) if handle else 0,
+            "duration_ms": int((now_ms() - started_ms) / 1000) if handle else 0,
             "partition_sizes": result.get("partition_sizes", {}),
             "results": result.get("results", []),
             "error": result.get("error", ""),
         })
 
-    def _remove(self, task_id: str) -> None:
+    def _remove(self, execution_id: str) -> None:
         with self._lock:
-            self._handles.pop(task_id, None)
+            self._handles.pop(execution_id, None)

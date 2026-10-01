@@ -59,14 +59,14 @@ class ShuffleCoordinator:
                 if worker is None:
                     continue
                 sizes = (mt.stats or {}).get("partition_sizes", {}) or {}
-                byte_count = int(sizes.get(f"{pname}.jsonl", 0))
+                byte_count = int(sizes.get(pname, 0))
                 sources.append({
                     "map_task_id": mt.task_id,
                     "worker_id": mt.worker_id,
                     "worker_url": worker.address,
                     "bytes": byte_count,
                 })
-                total_bytes += byte_count + 1
+                total_bytes += byte_count
 
             self.storage.write({
                 "job_id": job.job_id,

@@ -26,7 +26,7 @@ from backend.common.ids import partition_name
 from backend.common.jsonutil import now_ms
 from backend.common.logbus import LogBus
 from backend.common.models import Job, Task, WorkerRecord
-from backend.common.storage import Storage
+from backend.common.storage import Storage, read_json
 from backend.master.fault_tolerance import FaultTolerance
 from backend.master.job_manager import JobManager
 from backend.master.metrics import Metrics
@@ -103,6 +103,7 @@ class Scheduler:
             self._dispatch_tasks(job, C.TASK_MAP)
             map_tasks = self.job_manager.tasks_for(job.job_id, C.TASK_MAP)
             if map_tasks and all(t.status == C.TASK_SUCCEEDED for t in map_tasks):
+                self._validate_map_accounting(job, map_tasks)
                 self.shuffle.build(job)
                 self.job_manager.apply_job(job.job_id, lambda j: (
                     setattr(j, "status", C.JOB_SHUFFLE),
@@ -118,8 +119,10 @@ class Scheduler:
                                  task_id="shuffle")
         elif status == C.JOB_REDUCE:
             self._dispatch_tasks(job, C.TASK_REDUCE)
+            map_tasks = self.job_manager.tasks_for(job.job_id, C.TASK_MAP)
             reduce_tasks = self.job_manager.tasks_for(job.job_id, C.TASK_REDUCE)
             if reduce_tasks and all(t.status == C.TASK_SUCCEEDED for t in reduce_tasks):
+                self._validate_result_accounting(job, map_tasks, reduce_tasks)
                 self._finish_success(job)
 
         self._maybe_speculate(job)
@@ -217,7 +220,7 @@ class Scheduler:
             "mapper": job.mapper,
             "reducer": job.reducer,
             "params": job.params,
-            "attempt": 0,
+            "attempt": task.attempts,
             "simulate_failure": bool(job.params.get("simulate_failure", False)),
         }
         if task.kind == C.TASK_MAP:
@@ -239,6 +242,15 @@ class Scheduler:
         task = self.job_manager.get_task(job.job_id, payload.get("task_id", ""))
         if task is None or task.status == C.TASK_SUCCEEDED:
             return
+        attempt = int(payload.get("attempt", -1))
+        if attempt != task.attempts:
+            self.logbus.info(
+                job.job_id,
+                f"ignored stale status for task {task.task_id} "
+                f"(attempt {attempt}, current {task.attempts})",
+                task_id=task.task_id, worker_id=payload.get("worker_id", ""),
+            )
+            return
 
         def apply(t: Task) -> None:
             if t.status in (C.TASK_PENDING, C.TASK_RETRYING, C.TASK_ASSIGNED):
@@ -259,8 +271,17 @@ class Scheduler:
         task = self.job_manager.get_task(job.job_id, payload.get("task_id", ""))
         if task is None or task.status == C.TASK_SUCCEEDED:
             return  # duplicate completion from a speculative loser
-
         worker_id = payload.get("worker_id", "")
+        attempt = int(payload.get("attempt", -1))
+        if attempt != task.attempts:
+            self.logbus.info(
+                job.job_id,
+                f"ignored stale completion for task {task.task_id} "
+                f"(attempt {attempt}, current {task.attempts})",
+                task_id=task.task_id, worker_id=worker_id,
+            )
+            return
+
         status = payload.get("status", C.TASK_FAILED)
 
         if status != C.TASK_SUCCEEDED:
@@ -272,15 +293,16 @@ class Scheduler:
         def apply(t: Task) -> None:
             t.status = C.TASK_SUCCEEDED
             t.progress = 1.0
+            t.worker_id = worker_id or t.worker_id
             t.records_processed = int(payload.get("records_processed", 0))
             t.records_emitted = int(payload.get("records_emitted", 0))
             t.duration_ms = int(payload.get("duration_ms", 0)) * 1000
             t.finished_ms = now_ms()
             t.error = ""
             stats = dict(t.stats or {})
-            stats["partition_size_entries"] = payload.get("partition_sizes", {})
+            stats["partition_sizes"] = payload.get("partition_sizes", {})
             stats["results"] = payload.get("results", [])
-            stats["winning_worker"] = worker_id
+            stats["winning_worker"] = t.worker_id
             t.stats = stats
 
         self.job_manager.apply_task(job.job_id, task.task_id, apply)
@@ -300,6 +322,69 @@ class Scheduler:
         )
         self._cancel_speculative_losers(job, task, worker_id)
 
+    # ------------------------------------------------------------------
+    # Accounting invariants
+    # ------------------------------------------------------------------
+    def _fail_accounting(self, job: Job, message: str) -> None:
+        self.logbus.error(job.job_id, message, task_id="job")
+        self.job_manager.fail(job, message)
+
+    def _validate_map_accounting(self, job: Job, map_tasks: list[Task]) -> None:
+        processed = sum(t.records_processed for t in map_tasks)
+        if processed != job.input_rows:
+            self._fail_accounting(
+                job,
+                f"map input accounting mismatch: processed {processed}, declared {job.input_rows}",
+            )
+            raise ValueError(f"map processed {processed} != input rows {job.input_rows}")
+        if any(t.records_emitted < 0 for t in map_tasks):
+            self._fail_accounting(job, "map emitted accounting is negative")
+            raise ValueError("invalid negative map emitted count")
+
+    def _validate_result_accounting(
+        self, job: Job, map_tasks: list[Task], reduce_tasks: list[Task],
+    ) -> None:
+        map_emitted = sum(t.records_emitted for t in map_tasks)
+        reduce_fetched = sum(t.records_processed for t in reduce_tasks)
+        reduce_emitted = sum(t.records_emitted for t in reduce_tasks)
+        if reduce_fetched != map_emitted:
+            self._fail_accounting(
+                job,
+                f"shuffle accounting mismatch: fetched {reduce_fetched}, mapped {map_emitted}",
+            )
+            raise ValueError(f"reduce fetched {reduce_fetched} != map emitted {map_emitted}")
+
+        stored_records = 0
+        for task in reduce_tasks:
+            pname = partition_name(task.partition)
+            doc = read_json(
+                self.storage.path(
+                    "jobs", job.job_id, "results", C.STAGE_REDUCE, f"{pname}.json"
+                ),
+                default=None,
+            )
+            if doc is None:
+                self._fail_accounting(job, f"missing result partition {pname}")
+                raise ValueError(f"missing result partition {pname}")
+            records = doc.get("records", [])
+            actual_count = len(records) if isinstance(records, list) else 0
+            declared_count = int(doc.get("count", -1))
+            if actual_count != declared_count:
+                self._fail_accounting(
+                    job,
+                    f"result partition {pname} count mismatch: "
+                    f"metadata {declared_count}, records {actual_count}",
+                )
+                raise ValueError(f"result partition {pname} metadata/record mismatch")
+            stored_records += actual_count
+
+        if stored_records != reduce_emitted:
+            self._fail_accounting(
+                job,
+                f"result accounting mismatch: stored {stored_records}, reduced {reduce_emitted}",
+            )
+            raise ValueError(f"stored results {stored_records} != reduce emitted {reduce_emitted}")
+
     def _store_results(self, job: Job, task: Task, results: list) -> None:
         pname = partition_name(task.partition)
         self.storage.write({
@@ -307,7 +392,7 @@ class Scheduler:
             "partition": task.partition,
             "partition_name": pname,
             "task_id": task.task_id,
-            "records": list(reversed(results)),
+            "records": results,
             "count": len(results),
             "written_ms": now_ms(),
         }, "jobs", job.job_id, "results", C.STAGE_REDUCE, f"{pname}.json")
@@ -323,7 +408,7 @@ class Scheduler:
             if worker is not None:
                 try:
                     self.client.post(f"{worker.address}/task/cancel",
-                                     {"task_id": task.task_id}, timeout=2.0)
+                                     {"job_id": job.job_id, "task_id": task.task_id}, timeout=2.0)
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -337,7 +422,7 @@ class Scheduler:
             j.finished_ms = now_ms()
             j.stats["map_records_processed"] = sum(t.records_processed for t in map_tasks)
             j.stats["map_records_emitted"] = sum(t.records_emitted for t in map_tasks)
-            j.stats["reduce_records_emitted"] = sum(t.records_emitted for t in reduce_tasks) + sum(t.records_emitted for t in map_tasks)
+            j.stats["reduce_records_emitted"] = sum(t.records_emitted for t in reduce_tasks)
             j.stats["total_task_attempts"] = sum(t.attempts for t in map_tasks + reduce_tasks)
 
         self.job_manager.apply_job(job.job_id, apply)

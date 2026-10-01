@@ -107,6 +107,7 @@ class FaultTolerance:
                     self.job_manager.update_task(
                         job.job_id, task.task_id,
                         status=C.TASK_RETRYING, worker_id=None,
+                        attempts=task.attempts + 1,
                         error=f"worker {worker.name} died", retry_after_ms=0,
                     )
                     reassigned += 1

@@ -208,6 +208,8 @@ class MetricSample:
     load1: float = 0.0
     tasks_running: int = 0
     tasks_completed: int = 0
+    records_processed: int = 0
+    records_emitted: int = 0
     throughput: float = 0.0
 
     def to_dict(self) -> dict:

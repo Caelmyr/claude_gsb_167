@@ -15,6 +15,7 @@ back over HTTP.  Two pieces live here:
 from __future__ import annotations
 
 import heapq
+import itertools
 import os
 from typing import Any, Iterable, Iterator, Optional
 
@@ -48,6 +49,13 @@ class ShuffleStore:
         return os.path.join(self.job_dir(job_id, task_id), partition_filename(partition))
 
     # -- write --------------------------------------------------------
+    def reset_task(self, job_id: str, task_id: str) -> None:
+        """Remove one task's local intermediate output before a fresh attempt."""
+        import shutil
+        d = self.job_dir(job_id, task_id)
+        if os.path.isdir(d):
+            shutil.rmtree(d, ignore_errors=True)
+
     def append_partition(self, job_id: str, task_id: str, partition: int,
                          pairs: Iterable[tuple[Any, Any]]) -> int:
         """Append ``(key, value)`` pairs to a partition file, one JSON line each."""
@@ -108,6 +116,8 @@ class SpillSorter:
     remainder and then streams a fully sorted sequence using ``heapq.merge``.
     """
 
+    _run_ids = itertools.count(1)
+
     def __init__(self, spill: int = 20000, work_dir: str = "/tmp") -> None:
         self.spill = max(1, spill)
         self.work_dir = work_dir
@@ -115,6 +125,7 @@ class SpillSorter:
         self._mem: list[tuple[Any, Any]] = []
         self._runs: list[str] = []
         self._run_seq = 0
+        self._run_id = next(self._run_ids)
         self._total = 0
 
     def add(self, key: Any, value: Any) -> None:
@@ -133,7 +144,10 @@ class SpillSorter:
         # Sort by key.  Map/reduce keys for the built-in mappers are homogeneous
         # strings, so native ordering matches the grouping comparison.
         self._mem.sort(key=lambda kv: kv[0])
-        path = os.path.join(self.work_dir, f"gsb-sort-{os.getpid()}-{self._run_seq}.jsonl")
+        path = os.path.join(
+            self.work_dir,
+            f"gsb-sort-{os.getpid()}-{self._run_id}-{self._run_seq}.jsonl",
+        )
         self._run_seq += 1
         atomic_write_text(
             path,

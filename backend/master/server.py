@@ -140,10 +140,13 @@ class Master:
         for path in list_files(root, suffix=".json"):
             doc = read_json(path)
             if doc:
+                records = doc.get("records") or []
+                actual_count = len(records) if isinstance(records, list) else 0
                 out.append({
                     "partition": doc.get("partition"),
                     "partition_name": doc.get("partition_name"),
-                    "count": doc.get("count", 0),
+                    "count": actual_count,
+                    "declared_count": doc.get("count", actual_count),
                     "task_id": doc.get("task_id"),
                 })
         out.sort(key=lambda d: d.get("partition", 0))

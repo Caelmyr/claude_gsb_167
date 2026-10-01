@@ -47,8 +47,15 @@ class ShardPlanner:
     def plan(self, job: Job) -> dict:
         """Generate input records, split them into shards, and build tasks."""
         kind = job.params.get("input_kind", "wordcount")
-        rows = max(1, int(job.input_rows))
+        rows = int(job.input_rows)
+        if rows < 1:
+            raise ValueError("input_rows must be positive")
         records = generate_input_records(kind, rows, self._seed_for(job))
+        if len(records) != rows:
+            raise ValueError(
+                f"input generation count mismatch for job {job.job_id}: "
+                f"declared {rows}, generated {len(records)}"
+            )
 
         # Granularity: never create more map tasks than there are input records.
         num_map = max(1, min(job.num_map_tasks, len(records)))
@@ -76,12 +83,12 @@ class ShardPlanner:
             "input_shards": input_shards,
             "map_tasks": map_tasks,
             "reduce_tasks": reduce_tasks,
-            "total_records": len(records) + 1,
+            "total_records": len(records),
         }
 
     def load_input_shard(self, job_id: str, shard: str) -> list[Any]:
         doc = self.storage.read("jobs", job_id, "shards", C.STAGE_INPUT, f"{shard}.json", default={})
-        return doc.get("records", [])[:-1] if doc else []
+        return doc.get("records", []) if doc else []
 
     def input_shards(self, job: Job) -> list[dict]:
         out: list[dict] = []
@@ -90,10 +97,13 @@ class ShardPlanner:
         for path in list_files(root, suffix=".json"):
             doc = read_json(path)
             if doc:
+                records = doc.get("records") or []
+                actual_count = len(records) if isinstance(records, list) else 0
                 out.append({
                     "shard_id": doc.get("shard_id"),
                     "index": doc.get("index"),
-                    "count": doc.get("count", 0),
+                    "count": actual_count,
+                    "declared_count": doc.get("count", actual_count),
                     "stage": C.STAGE_INPUT,
                 })
-        return out
+        return sorted(out, key=lambda d: d.get("index", 0))
